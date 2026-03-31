@@ -1,22 +1,13 @@
 # coding: UTF-8
 """
-JY901S sample with a simple NEU forward viewer.
-
-The GUI only shows the body +Y axis (forward) expressed in NEU:
-- N: North
-- W: West
-- U: Up
+JY901S sample with forward direction and plane-hit output.
 """
 
-import datetime
 import math
 import platform
-import threading
 import time
 
 import lib.device_model as deviceModel
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
 from lib.protocol_resolver.roles.wit_protocol_resolver import WitProtocolResolver
 
@@ -24,10 +15,8 @@ welcome = """
 欢迎使用维特智能示例程序    Welcome to the Wit-Motoin sample program
 """
 
-_writeF = None
-_IsWriteF = False
-_pose_lock = threading.Lock()
-_latest_forward_neu = None
+IMU_POSITION_NWU = [0.0, 0.0, 1.2]
+TARGET_PLANE_W = 5.3
 
 
 def _normalize(vector):
@@ -39,12 +28,7 @@ def _normalize(vector):
 
 def solve_forward_in_neu(angle_x_deg, angle_z_deg):
     """
-    Convert pitch/yaw to the body +Y axis in NEU.
-
-    Assumptions used here:
-    - angleX is pitch, positive when the nose goes up
-    - angleZ is yaw, clockwise from North
-    - body +Y is the forward direction
+    Keep the current user-defined forward-direction convention unchanged.
     """
     pitch = math.radians(angle_x_deg)
     yaw = math.radians(angle_z_deg)
@@ -55,69 +39,22 @@ def solve_forward_in_neu(angle_x_deg, angle_z_deg):
     ])
 
 
-class NeuForwardViewer:
-    def __init__(self):
-        self.fig = plt.figure("JY901S +Y Forward in NEU")
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        self.fig.canvas.mpl_connect("close_event", self._on_close)
-        self._closed = False
-        self.anim = FuncAnimation(self.fig, self._update_frame, interval=100, cache_frame_data=False)
+def solve_plane_intersection(origin, forward, plane_w):
+    if forward is None:
+        return None
 
-    def _on_close(self, _event):
-        self._closed = True
+    direction_w = forward[1]
+    if abs(direction_w) < 1e-9:
+        return None
 
-    def _draw_arrow(self, origin, vector, color, label, linewidth=2.0):
-        self.ax.quiver(
-            origin[0],
-            origin[1],
-            origin[2],
-            vector[0],
-            vector[1],
-            vector[2],
-            color=color,
-            linewidth=linewidth,
-            arrow_length_ratio=0.12,
-        )
-        tip = [origin[i] + vector[i] for i in range(3)]
-        self.ax.text(tip[0], tip[1], tip[2], label, color=color)
+    distance = (plane_w - origin[1]) / direction_w
+    if distance < 0:
+        return None
 
-    def _update_frame(self, _frame_index):
-        self.ax.cla()
-        self.ax.set_title("Body +Y Forward in NEU")
-        self.ax.set_xlabel("N")
-        self.ax.set_ylabel("W")
-        self.ax.set_zlabel("U")
-        self.ax.set_xlim(-1.2, 1.2)
-        self.ax.set_ylim(-1.2, 1.2)
-        self.ax.set_zlim(-1.2, 1.2)
-        self.ax.set_box_aspect((1, 1, 1))
-
-        origin = [0.0, 0.0, 0.0]
-        self._draw_arrow(origin, [1.0, 0.0, 0.0], "tab:red", "N")
-        self._draw_arrow(origin, [0.0, 1.0, 0.0], "tab:green", "W")
-        self._draw_arrow(origin, [0.0, 0.0, 1.0], "tab:blue", "U")
-
-        with _pose_lock:
-            forward = _latest_forward_neu[:] if _latest_forward_neu is not None else None
-
-        if forward is None:
-            self.ax.text2D(0.03, 0.95, "Waiting for IMU data...", transform=self.ax.transAxes)
-            return
-
-        self._draw_arrow(origin, forward, "black", "+Y forward", linewidth=3.0)
-        self.ax.text2D(
-            0.03,
-            0.95,
-            "Forward(NEU)=({:.3f}, {:.3f}, {:.3f})".format(*forward),
-            transform=self.ax.transAxes,
-        )
-
-    def show(self):
-        plt.show()
-
-    @property
-    def closed(self):
-        return self._closed
+    return [
+        origin[i] + distance * forward[i]
+        for i in range(3)
+    ]
 
 
 def readConfig(device):
@@ -159,21 +96,20 @@ def FiledCalibration(device):
 
 
 def onUpdate(device):
-    global _latest_forward_neu
-
     angle_x = device.getDeviceData("angleX")
     angle_y = device.getDeviceData("angleY")
     angle_z = device.getDeviceData("angleZ")
     forward_text = "None,None,None"
-    forward_components = [None, None, None]
+    hit_text = "None,None,None"
 
     if angle_x is not None and angle_z is not None:
         forward = solve_forward_in_neu(angle_x, angle_z)
         if forward is not None:
-            with _pose_lock:
-                _latest_forward_neu = forward
-            forward_components = forward
+            hit_point = solve_plane_intersection(IMU_POSITION_NWU, forward, TARGET_PLANE_W)
             forward_text = "{:.3f},{:.3f},{:.3f}".format(*forward)
+            if hit_point is not None:
+                displayed_hit_point = [hit_point[0], 0.0, hit_point[2]]
+                hit_text = "{:.3f},{:.3f},{:.3f}".format(*displayed_hit_point)
 
     print(
         "芯片时间:" + str(device.getDeviceData("Chiptime")),
@@ -185,59 +121,9 @@ def onUpdate(device):
         "经度:" + str(device.getDeviceData("lon")) + " 纬度:" + str(device.getDeviceData("lat")),
         "航向角:" + str(device.getDeviceData("Yaw")) + " 地速:" + str(device.getDeviceData("Speed")),
         "四元数:" + str(device.getDeviceData("q1")) + "," + str(device.getDeviceData("q2")) + "," + str(device.getDeviceData("q3")) + "," + str(device.getDeviceData("q4")),
-        "+Y前向(NEU):" + forward_text,
+        "+Y前向:" + forward_text,
+        "平面交点:" + hit_text,
     )
-
-    if _IsWriteF:
-        temp_str = " " + str(device.getDeviceData("Chiptime"))
-        temp_str += "\t" + str(device.getDeviceData("accX")) + "\t" + str(device.getDeviceData("accY")) + "\t" + str(device.getDeviceData("accZ"))
-        temp_str += "\t" + str(device.getDeviceData("gyroX")) + "\t" + str(device.getDeviceData("gyroY")) + "\t" + str(device.getDeviceData("gyroZ"))
-        temp_str += "\t" + str(device.getDeviceData("angleX")) + "\t" + str(device.getDeviceData("angleY")) + "\t" + str(device.getDeviceData("angleZ"))
-        temp_str += "\t" + str(device.getDeviceData("temperature"))
-        temp_str += "\t" + str(device.getDeviceData("magX")) + "\t" + str(device.getDeviceData("magY")) + "\t" + str(device.getDeviceData("magZ"))
-        temp_str += "\t" + str(device.getDeviceData("lon")) + "\t" + str(device.getDeviceData("lat"))
-        temp_str += "\t" + str(device.getDeviceData("Yaw")) + "\t" + str(device.getDeviceData("Speed"))
-        temp_str += "\t" + str(device.getDeviceData("q1")) + "\t" + str(device.getDeviceData("q2"))
-        temp_str += "\t" + str(device.getDeviceData("q3")) + "\t" + str(device.getDeviceData("q4"))
-        temp_str += "\t" + str(forward_components[0]) + "\t" + str(forward_components[1]) + "\t" + str(forward_components[2])
-        temp_str += "\r\n"
-        _writeF.write(temp_str)
-        _writeF.flush()
-
-
-def startRecord():
-    global _writeF
-    global _IsWriteF
-
-    filename = datetime.datetime.now().strftime("%Y%m%d%H%M%S") + ".txt"
-    _writeF = open(filename, "w", encoding="utf-8")
-    _IsWriteF = True
-
-    header = "Chiptime"
-    header += "\tax(g)\tay(g)\taz(g)"
-    header += "\twx(deg/s)\twy(deg/s)\twz(deg/s)"
-    header += "\tAngleX(deg)\tAngleY(deg)\tAngleZ(deg)"
-    header += "\tT(degC)"
-    header += "\tmagx\tmagy\tmagz"
-    header += "\tlon\tlat"
-    header += "\tYaw\tSpeed"
-    header += "\tq1\tq2\tq3\tq4"
-    header += "\tForwardN\tForwardE\tForwardU"
-    header += "\r\n"
-    _writeF.write(header)
-    _writeF.flush()
-    print("开始记录数据: " + filename)
-
-
-def endRecord():
-    global _writeF
-    global _IsWriteF
-
-    _IsWriteF = False
-    if _writeF is not None:
-        _writeF.close()
-        _writeF = None
-    print("结束记录数据")
 
 
 if __name__ == "__main__":
@@ -264,15 +150,10 @@ if __name__ == "__main__":
     readConfig(device)
     device.dataProcessor.onVarChanged.append(onUpdate)
 
-    startRecord()
-    print("正在采集数据，关闭图形窗口即可退出。")
-    viewer = NeuForwardViewer()
-
+    print("正在采集数据，按回车键即可退出。")
     try:
-        viewer.show()
+        input()
     except KeyboardInterrupt:
         print("收到中断，正在关闭设备。")
     finally:
         device.closeDevice()
-        if _IsWriteF:
-            endRecord()
